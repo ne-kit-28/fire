@@ -13,24 +13,29 @@ def ensure_onnx_path(saved_model_dir, onnx_out):
     return onnx_out
 
 def discover_io(saved_model_dir, signature_def):
-    try:
-        import tensorflow as tf
-        m = tf.saved_model.load(saved_model_dir)
-        sig = m.signatures[signature_def]
-        ins, outs = list(sig.inputs), list(sig.outputs)
-        input_candidates = []
-        for t in ins:
-            name = t.name
-            rank = getattr(t, "shape", None)
-            rank_len = len(rank) if hasattr(rank, "__len__") else None
-            if (rank_len == 4) or ("input" in name.lower()):
-                input_candidates.append(name)
-        if not input_candidates and ins:
-            input_candidates = [ins[0].name]
-        output_names = [outs[0].name] if outs else []
-        return input_candidates, output_names
-    except Exception:
-        return [], []
+    import tensorflow as tf
+    m = tf.saved_model.load(saved_model_dir)
+    sig = m.signatures[signature_def]
+    ins = [t.name for t in sig.inputs]
+    outs = [t.name for t in sig.outputs]
+    # фильтруем «мусор»
+    good_ins = [n for n in ins if not n.lower().startswith("unknown")]
+    # приоритет по подстрокам
+    for key in ("input:", "serving_default_input", "input_layer", "input_"):
+        cand = [n for n in good_ins if key in n]
+        if cand:
+            input_name = cand[0]; break
+    else:
+        input_name = good_ins[0] if good_ins else ins[0]
+    # выход: предпочитаем Identity или prob
+    good_outs = [n for n in outs if not n.lower().startswith("unknown")]
+    for key in ("Identity:", "prob:", "output"):
+        cand = [n for n in good_outs if key.split(":")[0] in n]
+        if cand:
+            output_name = cand[0]; break
+    else:
+        output_name = good_outs[0] if good_outs else outs[0]
+    return input_name, output_name
 
 def main():
     ap = argparse.ArgumentParser()
@@ -50,20 +55,22 @@ def main():
 
     onnx_out = ensure_onnx_path(sm_dir, args.onnx_out)
 
-    in_names, out_names = args.inputs, args.outputs
-    if not in_names or not out_names:
-        auto_in, auto_out = discover_io(sm_dir, args.signature_def)
-        if not in_names and auto_in: in_names = [auto_in[0]]
-        if not out_names and auto_out: out_names = [auto_out[0]]
-    if not in_names or not out_names:
-        raise RuntimeError("Failed to determine inputs/outputs. Provide --inputs and --outputs explicitly.")
-
-    inputs_as_nchw = args.inputs_as_nchw or in_names
+    # имена I/O
+    if args.inputs and args.outputs:
+        in_name = args.inputs[0]
+        out_name = args.outputs[0]
+    else:
+        try:
+            in_name, out_name = discover_io(sm_dir, args.signature_def)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось определить вход/выход: {e}\nУкажите --inputs и --outputs явно.")
+    inputs_as_nchw = args.inputs_as_nchw[0] if args.inputs_as_nchw else in_name
 
     print(f"SavedModel: {sm_dir}")
-    print(f"Inputs: {in_names} | Outputs: {out_names} | Inputs-as-NCHW: {inputs_as_nchw}")
+    print(f"Input: {in_name} | Output: {out_name} | Inputs-as-NCHW: {inputs_as_nchw}")
     print(f"ONNX out: {onnx_out}")
 
+    # попытка через API, иначе CLI
     try:
         import tf2onnx as t2o
         if hasattr(t2o, "convert") and hasattr(t2o.convert, "from_saved_model"):
@@ -72,9 +79,9 @@ def main():
                 output_path=onnx_out,
                 opset=args.opset,
                 signature_def=args.signature_def,
-                input_names=in_names,
-                output_names=out_names,
-                inputs_as_nchw=inputs_as_nchw,
+                input_names=[in_name],
+                output_names=[out_name],
+                inputs_as_nchw=[inputs_as_nchw],
             )
         else:
             raise AttributeError("tf2onnx.convert.from_saved_model not available")
@@ -83,9 +90,9 @@ def main():
             sys.executable, "-m", "tf2onnx.convert",
             "--saved-model", sm_dir,
             "--signature_def", args.signature_def,
-            "--inputs", ",".join(in_names),
-            "--outputs", ",".join(out_names),
-            "--inputs-as-nchw", ",".join(inputs_as_nchw),
+            "--inputs", in_name,
+            "--outputs", out_name,
+            "--inputs-as-nchw", inputs_as_nchw,
             "--opset", str(args.opset),
             "--output", onnx_out,
         ]
