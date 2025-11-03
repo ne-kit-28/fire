@@ -18,6 +18,7 @@ def main():
     ap.add_argument("--save_dir", default="captures")
     ap.add_argument("--cam_w", type=int, default=320)
     ap.add_argument("--cam_h", type=int, default=240)
+    # Если ваш SavedModel->ONNX был с --inputs-as-nchw, оставьте как есть.
     args = ap.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -28,7 +29,8 @@ def main():
     in_w = in_h = args.input_size
 
     cam = Picamera2()
-    cfg = cam.create_preview_configuration(main={"format": 'XRGB8888', "size": (args.cam_w, args.cam_h)})
+    # 3-канальный формат, чтобы не получить 4 канала
+    cfg = cam.create_preview_configuration(main={"format": 'RGB888', "size": (args.cam_w, args.cam_h)})
     cam.configure(cfg)
     cam.start()
     time.sleep(0.2)
@@ -38,8 +40,16 @@ def main():
 
     try:
         while True:
-            frame = cam.capture_array()
-            blob = cv2.dnn.blobFromImage(frame, scalefactor=1.0, size=(in_w, in_h), swapRB=True)
+            frame = cam.capture_array()  # RGB, shape (H,W,3)
+            # На всякий случай отрезаем альфа, если вдруг пришёл BGRA/RGBA
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = frame[:, :, :3]
+
+            # Модель обучалась на RGB; blobFromImage по умолчанию ждёт BGR,
+            # поэтому swapRB=False (ничего не меняем), т.к. у нас уже RGB.
+            blob = cv2.dnn.blobFromImage(
+                frame, scalefactor=1.0, size=(in_w, in_h), swapRB=False
+            )  # -> NCHW: (1,3,H,W)
             net.setInput(blob)
             out = net.forward()
             prob = float(out.reshape(-1)[0])
@@ -55,7 +65,7 @@ def main():
                 now = time.time()
                 if now - last_save >= args.cooldown:
                     fn = time.strftime("%Y%m%d_%H%M%S") + f"_{prob:.2f}.jpg"
-                    cv2.imwrite(os.path.join(args.save_dir, fn), frame)
+                    cv2.imwrite(os.path.join(args.save_dir, fn), frame[:, :, ::-1])  # сохраняем как BGR для cv2
                     last_save = now
             elif neg >= args.streak:
                 GPIO.output(args.pin, GPIO.LOW)
