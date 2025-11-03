@@ -18,7 +18,8 @@ def main():
     ap.add_argument("--save_dir", default="captures")
     ap.add_argument("--cam_w", type=int, default=320)
     ap.add_argument("--cam_h", type=int, default=240)
-    # Если ваш SavedModel->ONNX был с --inputs-as-nchw, оставьте как есть.
+    ap.add_argument("--grid", type=int, default=3)
+    ap.add_argument("--annotate", action="store_true")
     args = ap.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
@@ -29,33 +30,40 @@ def main():
     in_w = in_h = args.input_size
 
     cam = Picamera2()
-    # 3-канальный формат, чтобы не получить 4 канала
     cfg = cam.create_preview_configuration(main={"format": 'RGB888', "size": (args.cam_w, args.cam_h)})
-    cam.configure(cfg)
-    cam.start()
-    time.sleep(0.2)
+    cam.configure(cfg); cam.start(); time.sleep(0.2)
 
     pos = neg = 0
     last_save = 0.0
 
     try:
         while True:
-            frame = cam.capture_array()  # RGB, shape (H,W,3)
-            # На всякий случай отрезаем альфа, если вдруг пришёл BGRA/RGBA
+            frame = cam.capture_array()  # RGB (H,W,3)
             if frame.ndim == 3 and frame.shape[2] == 4:
                 frame = frame[:, :, :3]
 
-            # Модель обучалась на RGB; blobFromImage по умолчанию ждёт BGR,
-            # поэтому swapRB=False (ничего не меняем), т.к. у нас уже RGB.
-            blob = cv2.dnn.blobFromImage(
-                frame, scalefactor=1.0, size=(in_w, in_h), swapRB=False
-            )  # -> NCHW: (1,3,H,W)
+            H, W = frame.shape[:2]
+            gy = np.linspace(0, H, args.grid + 1, dtype=int)
+            gx = np.linspace(0, W, args.grid + 1, dtype=int)
+
+            tiles = []
+            for i in range(args.grid):
+                for j in range(args.grid):
+                    tiles.append(frame[gy[i]:gy[i+1], gx[j]:gx[j+1]])
+
+            blob = cv2.dnn.blobFromImages(tiles, scalefactor=1.0, size=(in_w, in_h), swapRB=False)
             net.setInput(blob)
             out = net.forward()
-            prob = float(out.reshape(-1)[0])
+            probs = out.reshape(-1)  # длина grid*grid, [0..1]
+            probs2d = probs.reshape(args.grid, args.grid)
 
-            fire = prob >= args.threshold
-            if fire:
+            fire_cells = probs2d >= args.threshold
+            fire_any = bool(fire_cells.any())
+            prob_max = float(probs.max())
+            max_idx = int(probs.argmax())
+            max_r, max_c = divmod(max_idx, args.grid)
+
+            if fire_any:
                 pos += 1; neg = 0
             else:
                 neg += 1; pos = 0
@@ -64,13 +72,28 @@ def main():
                 GPIO.output(args.pin, GPIO.HIGH)
                 now = time.time()
                 if now - last_save >= args.cooldown:
-                    fn = time.strftime("%Y%m%d_%H%M%S") + f"_{prob:.2f}.jpg"
-                    cv2.imwrite(os.path.join(args.save_dir, fn), frame[:, :, ::-1])  # сохраняем как BGR для cv2
+                    img = frame.copy()
+                    if args.annotate:
+                        # белая сетка, зелёная рамка вокруг сработавших ячеек
+                        for k in range(1, args.grid):
+                            cv2.line(img, (gx[k], 0), (gx[k], H), (255,255,255), 1)
+                            cv2.line(img, (0, gy[k]), (W, gy[k]), (255,255,255), 1)
+                        for i in range(args.grid):
+                            for j in range(args.grid):
+                                if fire_cells[i, j]:
+                                    cv2.rectangle(img, (gx[j], gy[i]), (gx[j+1], gy[i+1]), (0,255,0), 2)
+                        cv2.putText(img, f"max:{prob_max:.2f} at ({max_r},{max_c})", (5, 15), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                    fn = time.strftime("%Y%m%d_%H%M%S") + f"_{prob_max:.2f}.jpg"
+                    cv2.imwrite(os.path.join(args.save_dir, fn), img[:, :, ::-1])  # RGB->BGR
                     last_save = now
             elif neg >= args.streak:
                 GPIO.output(args.pin, GPIO.LOW)
 
-            print(f"prob={prob:.2f} state={'FIRE' if fire else 'normal'} pos={pos} neg={neg}")
+            # Краткий лог по сетке: максимум и список сработавших
+            cells_on = np.argwhere(fire_cells)
+            cells_on_str = ",".join([f"({r},{c})" for r, c in cells_on]) if cells_on.size else "-"
+            print(f"max={prob_max:.2f} at ({max_r},{max_c}); on: {cells_on_str}; pos={pos} neg={neg}")
+
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             time.sleep(0.05)
