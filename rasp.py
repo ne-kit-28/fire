@@ -16,20 +16,19 @@ def main():
     ap.add_argument("--model", default="model/fire_classifier3.onnx")
     ap.add_argument("--input_size", type=int, default=64)
     ap.add_argument("--threshold", type=float, default=0.6)
-    ap.add_argument("--streak", type=int, default=3)
+    ap.add_argument("--streak", type=int, default=1)
     ap.add_argument("--alarm_pin", type=int, default=17)
     ap.add_argument("--cooldown", type=float, default=2.0)
     ap.add_argument("--save_dir", default="captures")
     ap.add_argument("--cam_w", type=int, default=320)
     ap.add_argument("--cam_h", type=int, default=240)
-    ap.add_argument("--grid", type=int, default=3)
+    ap.add_argument("--grid", type=int, default=2)
     ap.add_argument("--annotate", action="store_true")
-    # PWM (вертикальный канал подвеса)
     ap.add_argument("--pwm_pin", type=int, default=18)
     ap.add_argument("--pwm_freq", type=int, default=50)
     ap.add_argument("--pwm_min_us", type=int, default=1000)
     ap.add_argument("--pwm_max_us", type=int, default=2000)
-    ap.add_argument("--pwm_center_us", type=int, default=1600)
+    ap.add_argument("--pwm_center_us", type=int, default=1300)
     ap.add_argument("--pwm_step_us", type=int, default=100)
     ap.add_argument("--pwm_invert", action="store_true")
     args = ap.parse_args()
@@ -38,7 +37,6 @@ def main():
 
     GPIO.setup(args.alarm_pin, GPIO.OUT)
     GPIO.output(args.alarm_pin, GPIO.LOW)
-
     GPIO.setup(args.pwm_pin, GPIO.OUT)
     pwm = GPIO.PWM(args.pwm_pin, args.pwm_freq)
     pwm_cur_us = int(np.clip(args.pwm_center_us, args.pwm_min_us, args.pwm_max_us))
@@ -58,11 +56,11 @@ def main():
 
     try:
         while True:
-            frame = cam.capture_array()  # RGB (H,W,3)
+            frame = cam.capture_array()
             if frame.ndim == 3 and frame.shape[2] == 4:
                 frame = frame[:, :, :3]
-
             H, W = frame.shape[:2]
+
             gy = np.linspace(0, H, args.grid + 1, dtype=int)
             gx = np.linspace(0, W, args.grid + 1, dtype=int)
 
@@ -74,7 +72,25 @@ def main():
             blob = cv2.dnn.blobFromImages(tiles, scalefactor=1.0, size=(in_w, in_h), swapRB=False)
             net.setInput(blob)
             out = net.forward()
-            probs = out.reshape(-1)  # длина grid*grid, [0..1]
+            out_s = np.squeeze(out)
+
+            if out_s.ndim == 2:
+                if out_s.shape[1] == 1:
+                    probs = out_s[:, 0]
+                else:
+                    logits = out_s.astype(np.float32)
+                    logits -= logits.max(axis=1, keepdims=True)
+                    e = np.exp(logits)
+                    probs = e[:, 1] / e.sum(axis=1, keepdims=True)
+            elif out_s.ndim == 1:
+                probs = out_s
+            else:
+                probs = out_s.reshape(-1)
+
+            probs = probs.reshape(-1)
+            need = args.grid * args.grid
+            if probs.size != need:
+                probs = probs[:need]
             probs2d = probs.reshape(args.grid, args.grid)
 
             fire_cells = probs2d >= args.threshold
@@ -109,11 +125,9 @@ def main():
             elif neg >= args.streak:
                 GPIO.output(args.alarm_pin, GPIO.LOW)
 
-            # Вертикальное выравнивание по строке с максимумом
             if fire_any:
-                center_r = args.grid // 2
-                err = max_r - center_r
-                if err != 0:
+                err = ((max_r + 0.5) / args.grid) - 0.5
+                if abs(err) > 1e-6:
                     step = args.pwm_step_us * (1 if err > 0 else -1)
                     if args.pwm_invert:
                         step = -step
